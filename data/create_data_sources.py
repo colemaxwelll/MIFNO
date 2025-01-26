@@ -54,9 +54,9 @@ path_formatted = options['path_formatted']
 
 folder_name = f"HEMEWS3D_S{S_in}_Z{S_in_z}_T{Nt}_fmax{fmax}_rot{rotation_angle}"
 
-data = pd.read_csv(f'{path_raw}source_properties.csv', index_col=[0])
+data = pd.read_table(f'{path_raw}source_properties.tab', index_col=[0])
 
-for i in range(Ntrain+Nval+Ntest):
+for i in range(Ntrain+Nval):
     source_position = data.iloc[i,0:3].values.astype(np.float32)
     source_angle = data.iloc[i,3:6].values.astype(np.float32)
     source_moment = compute_moment_tensor(source_angle[0], source_angle[1], source_angle[2], 1)

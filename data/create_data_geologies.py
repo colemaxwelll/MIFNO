@@ -42,7 +42,7 @@ if not folder_name+'_test' in os.listdir('./formatted/'):
     os.mkdir('./formatted/'+folder_name+'_test')
 
 
-for I in range(100000, 100000+Ntrain+Nval+Ntest, 2000):
+for I in range(100000, 100000+Ntrain+Nval, 2000):
     # Load geology matrices
     data_a = np.load(path_raw + f'material{I}-{I+1999}.npy')
 

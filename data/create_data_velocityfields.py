@@ -57,10 +57,10 @@ path_formatted = options['path_formatted']
 
 folder_name = f"HEMEWS3D_S{S_in}_Z{S_in_z}_T{Nt}_fmax{fmax}_rot{rotation_angle}"
 
-for I in range(0, Ntrain+Nval+Ntest, 100): # data are provided in batches of 100 samples
+for I in range(0, Ntrain+Nval, 100): # data are provided in batches of 100 samples
     # extract individual velocity fields
-    with ZipFile(f"./raw/velocity{100000+I}-{100000+I+99}.zip", 'r') as zObject: 
-        zObject.extractall("./raw/")
+    with ZipFile(path_raw + f"velocity{100000+I}-{100000+I+99}.zip", 'r') as zObject: 
+        zObject.extractall(path_raw)
         
     for i in range(I, I+100):
         if i < Ntrain:
@@ -70,7 +70,7 @@ for I in range(0, Ntrain+Nval+Ntest, 100): # data are provided in batches of 100
         else:
             folder_type = 'test'
         
-        g = h5py.File(f"./raw/velocity{100000+I}-{100000+I+99}/sample{100000+i}.h5", 'r')
+        g = h5py.File(path_raw + f"velocity{100000+I}-{100000+I+99}/sample{100000+i}.h5", 'r')
         for comp in ['uE', 'uN', 'uZ']:
             u = g[comp][:].reshape(S_out*S_out, -1) # reshape to S_out*S_out x 800
             u = butter_lowpass_filter(u, fmax, dt=0.01, order=4) # filter to remove high frequencies
@@ -98,6 +98,6 @@ for I in range(0, Ntrain+Nval+Ntest, 100): # data are provided in batches of 100
             h.create_dataset('uN', data = uN, dtype=np.float32)
             h.create_dataset('uZ', data = uZ, dtype=np.float32)
     
-    shutil.rmtree(f"./raw/velocity{100000+I}-{100000+I+99}")
+    shutil.rmtree(path_raw + f"velocity{100000+I}-{100000+I+99}")
     if I % 1000 == 0:
         print(f'step {I}/{Ntrain+Nval+Ntest}')

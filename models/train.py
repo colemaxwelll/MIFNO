@@ -7,7 +7,10 @@ import torch.nn.functional as F
 from torch import optim
 import h5py
 import json
-import horovod.torch as hvd # for multi GPU
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import os
 import argparse
 
 from utils_models import get_device, get_batch_size, loss_criterion, RunningAverage, EarlyStopper
@@ -91,13 +94,31 @@ T_out = options['T_out']
 padding = options['padding']
 
 
+def setup_distributed(rank, world_size):
+    # Initialize the distributed process group
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_RANK"] = str(rank)  # Typically, local rank is the same as the global rank in single-node setups
+
+    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)  # Use NCCL for GPU training
+    torch.cuda.set_device(rank)  # Set device based on local rank
+
+def cleanup_distributed():
+    # Clean up the distributed process group
+    dist.destroy_process_group()
+
 
 if __name__ == '__main__':
     ### INITIALIZE HOROVOD
-    hvd.init()
-    if torch.cuda.is_available():
-        torch.cuda.set_device(hvd.local_rank())
-    verbose = 2 if hvd.rank() == 0 else 0
+    verbose = True
+
+    rank = int(os.environ.get("PMI_RANK", -1))  # Default to -1 if not set
+    world_size = int(os.environ.get("PMI_SIZE", -1))  # Default to -1 if not set
+
+    if rank == -1 or world_size == -1:
+        raise ValueError("MPI environment variables (PMI_RANK, PMI_SIZE) not set correctly.")
+
+    setup_distributed(rank, world_size)
 
     train_data = GeologyTracesSourceDataset(options['dir_data_train'], S_in=S_in, S_in_z=S_in_z,
                                             S_out=S_out, T_out=T_out,
@@ -112,8 +133,7 @@ if __name__ == '__main__':
         
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_data,
                                                                     shuffle=True,
-                                                                    num_replicas=hvd.size(),
-                                                                    rank=hvd.rank())
+                                                                    num_replicas=dist.get_world_size(), rank=dist.get_rank())
 
     train_loader = torch.utils.data.DataLoader(train_data,
                                                batch_size=batch_size,
@@ -127,7 +147,7 @@ if __name__ == '__main__':
                                              shuffle=True,
                                              num_workers=2)
 
-    if verbose:
+    if verbose and dist.get_rank() == 0:
         print(f'using {len(train_data)} training data and {len(val_data)} validation data')
 
     ### MODEL
@@ -201,7 +221,7 @@ if __name__ == '__main__':
             raise Exception(f"source {source_orientation} is not defined")
     
     
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         if model_type == 'MIFNO':
             with open(f"{dir_logs}models/architecture-{name_config}-epochs{epochs}.json", mode='w', encoding='utf-8') as param_file:
                 json.dump({'architecture':{'model type':model_type,
@@ -282,16 +302,17 @@ if __name__ == '__main__':
         NGPUs = torch.cuda.device_count()
     else:
         NGPUs = 0
-    if verbose:
+    if verbose and dist.get_rank() == 0:
         print(f'Using {NGPUs} GPUs for training')
-    model.to(device)
 
+    model.to(rank)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     if verbose:
         nb_params = 0
         for name, layer in model.named_parameters():
             nb_params += torch.numel(layer)
-        print(f'Total nb of parameters : {nb_params:.2e}')
+        # print(f'Total nb of parameters : {nb_params:.2e}')
 
     # Store losses history
     train_history = {'loss_relative':[], 'loss_absolute':[]}
@@ -300,8 +321,7 @@ if __name__ == '__main__':
 
     
     ### OPTIMIZER
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate*hvd.size(), betas=(0.9, 0.999))
-    optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.999))
     lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=10, verbose=True) 
     early_stopper = EarlyStopper(patience=patience, min_delta=0.0001)
 
@@ -324,7 +344,7 @@ if __name__ == '__main__':
             outE, outN, outZ = model(a, s)
             loss_rel = loss_criterion((outE,outN,outZ), (uE,uN,uZ), loss_weights, relative=True)
             loss_abs = loss_criterion((outE,outN,outZ), (uE,uN,uZ), loss_weights, relative=False)
-            
+
             train_losses_relative.update(loss_rel.item(), get_batch_size(a))
             train_losses_absolute.update(loss_abs.item(), get_batch_size(a))
             
@@ -332,12 +352,16 @@ if __name__ == '__main__':
             optimizer.zero_grad()
             loss_rel.backward()
             optimizer.step()
+
+            # if dist.get_rank() == 0
+            #     print(loss_abs, flush=True)
+
         
         train_history['loss_relative'].append(train_losses_relative.avg)
         train_history['loss_absolute'].append(train_losses_absolute.avg)
 
         # validation
-        if hvd.rank() == 0:
+        if dist.get_rank() == 0:
             model.eval()
             with torch.no_grad():
                 val_losses_relative = RunningAverage()
@@ -390,7 +414,7 @@ if __name__ == '__main__':
                 last_epoch_saved = ep # to remove the last intermediate save at the end
                 
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         # save the final loss
         with h5py.File(f'{dir_logs}loss/loss-{name_config}-epochs{ep+1}.h5', 'w') as f:
             f.create_dataset('epochs', data=np.arange(start_epoch, ep+1))
@@ -405,3 +429,5 @@ if __name__ == '__main__':
         if ep!= epochs-1:
             os.rename(f'{dir_logs}models/bestmodel-{name_config}-epochs{epochs}.pt', f'{dir_logs}models/bestmodel-{name_config}-epochs{ep+1}.pt')
             os.rename(f'{dir_logs}models/architecture-{name_config}-epochs{epochs}.json', f'{dir_logs}models/architecture-{name_config}-epochs{ep+1}.json')
+
+    cleanup_distributed()
